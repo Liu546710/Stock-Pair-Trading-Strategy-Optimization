@@ -63,10 +63,8 @@ class DataPreprocessor:
             print(f"发现 {duplicate_count} 行重复数据 (基于关键列)")
             self.processed_data = self.processed_data[~duplicates]
         
-        # 确保数据连续性 - 为每个股票创建完整的日期范围
-        all_dates = pd.date_range(start=self.processed_data['date'].min(), 
-                                 end=self.processed_data['date'].max(), 
-                                 freq='B')  # 'B'表示工作日
+        # 确保数据连续性 - 使用实际出现的交易日（避免引入法定节假日的空行）
+        all_dates = pd.DatetimeIndex(sorted(self.processed_data['date'].unique()))
         
         stocks = self.processed_data['stock_code'].unique()
         
@@ -97,13 +95,13 @@ class DataPreprocessor:
         ).reset_index(drop=True)
         
         # 对于仍然缺失的值，使用合理的默认值填充
-        self.processed_data['close'].fillna(method='ffill', inplace=True)
-        self.processed_data['open'].fillna(self.processed_data['close'], inplace=True)
-        self.processed_data['high'].fillna(self.processed_data['close'], inplace=True)
-        self.processed_data['low'].fillna(self.processed_data['close'], inplace=True)
-        self.processed_data['volume'].fillna(0, inplace=True)
-        self.processed_data['amount'].fillna(0, inplace=True)
-        self.processed_data['pct_change'].fillna(0, inplace=True)
+        self.processed_data['close'] = self.processed_data['close'].ffill()
+        self.processed_data['open'] = self.processed_data['open'].fillna(self.processed_data['close'])
+        self.processed_data['high'] = self.processed_data['high'].fillna(self.processed_data['close'])
+        self.processed_data['low'] = self.processed_data['low'].fillna(self.processed_data['close'])
+        self.processed_data['volume'] = self.processed_data['volume'].fillna(0)
+        self.processed_data['amount'] = self.processed_data['amount'].fillna(0)
+        self.processed_data['pct_change'] = self.processed_data['pct_change'].fillna(0)
         
         # 报告处理后的数据量
         processed_count = len(self.processed_data)
@@ -167,7 +165,7 @@ class DataPreprocessor:
             low_close = np.abs(stock_data['low'] - stock_data['close'].shift())
             
             ranges = pd.concat([high_low, high_close, low_close], axis=1)
-            true_range = np.max(ranges, axis=1)
+            true_range = ranges.max(axis=1)
             stock_data['atr'] = true_range.rolling(14).mean()
             
             # 9. 计算价格变化率
@@ -181,7 +179,7 @@ class DataPreprocessor:
             
             # 填充缺失值
             stock_data = stock_data.replace([np.inf, -np.inf], np.nan)
-            stock_data = stock_data.fillna(method='ffill')
+            stock_data = stock_data.ffill()
             stock_data = stock_data.fillna(0)  # 对于仍然缺失的值使用0填充
             
             # 更新数据
@@ -200,9 +198,10 @@ class DataPreprocessor:
         pairs_results = []
         
         # 1. 先进行同行业内配对
-        for industry in self.processed_data['industry_x'].unique():
+        ind_col = 'industry_x' if 'industry_x' in self.processed_data.columns else 'industry'
+        for industry in self.processed_data[ind_col].unique():
             # 获取同行业的股票
-            industry_data = self.processed_data[self.processed_data['industry_x'] == industry]
+            industry_data = self.processed_data[self.processed_data[ind_col] == industry]
             stock_codes = industry_data['stock_code'].unique()
             
             print(f"\n处理 {industry} 行业，共有 {len(stock_codes)} 只股票")
@@ -235,7 +234,7 @@ class DataPreprocessor:
                         # 计算价格比率
                         price_ratio = stock1_prices / stock2_prices
                         ratio_mean = np.mean(price_ratio)
-                        ratio_std = np.std(price_ratio)
+                        ratio_std = np.std(price_ratio, ddof=1)  # 样本标准差
                         
                         # 计算z-score
                         current_ratio = price_ratio[-1]
@@ -265,26 +264,30 @@ class DataPreprocessor:
         print("\n开始寻找跨行业配对...")
         all_stocks = self.processed_data['stock_code'].unique()
         
-        # 随机选择一部分跨行业组合进行测试
-        cross_industry_pairs = []
-        for i in range(len(all_stocks)):
-            for j in range(i+1, len(all_stocks)):
-                stock1 = all_stocks[i]
-                stock2 = all_stocks[j]
-                
-                # 确保是跨行业的
-                stock1_industry = self.processed_data[self.processed_data['stock_code'] == stock1]['industry_x'].iloc[0]
-                stock2_industry = self.processed_data[self.processed_data['stock_code'] == stock2]['industry_x'].iloc[0]
-                
-                if stock1_industry != stock2_industry:
-                    cross_industry_pairs.append((stock1, stock2))
+        # 预建股票→行业映射，避免循环内全表查询
+        ind_col = 'industry_x' if 'industry_x' in self.processed_data.columns else 'industry'
+        stock_industry_map = (
+            self.processed_data.drop_duplicates('stock_code')
+            .set_index('stock_code')[ind_col].to_dict()
+        )
         
-        # 如果跨行业组合太多，随机选择一部分
+        # 枚举所有跨行业配对
+        cross_industry_pairs = [
+            (all_stocks[i], all_stocks[j])
+            for i in range(len(all_stocks))
+            for j in range(i + 1, len(all_stocks))
+            if stock_industry_map.get(all_stocks[i]) != stock_industry_map.get(all_stocks[j])
+        ]
+        
+        # 固定随机种子保证可复现，超出上限时抽样
         if len(cross_industry_pairs) > 200:
+            random.seed(42)
             cross_industry_pairs = random.sample(cross_industry_pairs, 200)
         
         # 分析跨行业配对
         for stock1, stock2 in cross_industry_pairs:
+            stock1_industry = stock_industry_map.get(stock1, '')
+            stock2_industry = stock_industry_map.get(stock2, '')
             # 获取两只股票的收盘价序列
             stock1_data = self.processed_data[self.processed_data['stock_code'] == stock1]
             stock2_data = self.processed_data[self.processed_data['stock_code'] == stock2]
@@ -307,7 +310,7 @@ class DataPreprocessor:
                 # 计算价格比率
                 price_ratio = stock1_prices / stock2_prices
                 ratio_mean = np.mean(price_ratio)
-                ratio_std = np.std(price_ratio)
+                ratio_std = np.std(price_ratio, ddof=1)  # 样本标准差
                 
                 # 计算z-score
                 current_ratio = price_ratio[-1]
@@ -336,7 +339,9 @@ class DataPreprocessor:
         # 转换为DataFrame并排序
         self.pairs_data = pd.DataFrame(pairs_results)
         if len(self.pairs_data) > 0:
-            self.pairs_data = self.pairs_data.sort_values('z_score', ascending=False)
+            self.pairs_data = self.pairs_data.sort_values(
+                'z_score', key=lambda s: s.abs(), ascending=False
+            )
             
             # 保存配对结果
             pairs_path = os.path.join(os.path.dirname(self.output_path), 'hedge_pairs.csv')
@@ -384,7 +389,7 @@ class DataPreprocessor:
             market_indicators['market_oversold'] = (market_indicators['market_rsi'] < 30).astype(int)
         
         # 填充缺失值
-        market_indicators = market_indicators.fillna(method='ffill').fillna(0)
+        market_indicators = market_indicators.ffill().fillna(0)
         
         # 将市场指标合并到原始数据
         self.processed_data = pd.merge(self.processed_data, market_indicators, on='date', how='left')

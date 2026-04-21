@@ -3,19 +3,8 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import os
-from models.dqn_model import HybridAgent
+from models.dqn_model import DQN, DQNAgent
 from models.hedge_env import HedgeEnv
-
-def calculate_max_drawdown(returns):
-    # 计算累计收益
-    cumulative_returns = np.cumsum(returns)
-    # 计算当前高点
-    running_max = np.maximum.accumulate(cumulative_returns)
-    # 计算回撤
-    drawdown = running_max - cumulative_returns
-    # 最大回撤
-    max_drawdown = np.max(drawdown)
-    return max_drawdown
 
 def evaluate_model():
     # 设置matplotlib参数
@@ -39,30 +28,15 @@ def evaluate_model():
     pairs_data['stock1'] = pairs_data['stock1'].astype(float).astype(str)
     pairs_data['stock2'] = pairs_data['stock2'].astype(float).astype(str)
     
-    # ── 只在测试集上评估（与训练集/验证集时间段完全隔离）──
-    split_path = os.path.join(results_dir, 'data_split.json')
-    if os.path.exists(split_path):
-        import json
-        with open(split_path) as f:
-            split_info = json.load(f)
-        val_end = pd.to_datetime(split_info['val_end'])
-        data['date'] = pd.to_datetime(data['date'])
-        test_data = data[data['date'] > val_end].copy()
-        print(f"测试集时间范围: {test_data['date'].min().date()} ~ {test_data['date'].max().date()}")
-        print(f"测试集行数: {len(test_data)}")
-    else:
-        print("警告: 未找到 data_split.json，将使用全量数据评估（可能存在数据泄露）")
-        test_data = data.copy()
-    
     # 创建环境和加载模型
-    env = HedgeEnv(test_data, pairs_data)
+    env = HedgeEnv(data, pairs_data)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
-    agent = HybridAgent(state_dim, action_dim)
+    agent = DQNAgent(state_dim, action_dim)
     agent.load('results/train/best_model.pth')
     
     # 创建价格数据透视表
-    price_pivot = test_data.pivot(index='date', columns='stock_code', values='close')
+    price_pivot = data.pivot(index='date', columns='stock_code', values='close')
     
     # 评估结果存储
     all_returns = []
@@ -88,7 +62,6 @@ def evaluate_model():
         
         # 运行模型获取仓位和回报
         env.current_pair_idx = pair_idx - 1
-        agent.reset()   # 重置时序缓冲区
         state = env.reset()
         done = False
         positions = []
@@ -100,8 +73,6 @@ def evaluate_model():
             positions.append(env.position)
             returns.append(reward)
             state = next_state
-        
-
             
         # 计算夏普比率
         sharpe_ratio = np.mean(returns) / (np.std(returns) + 1e-10) * np.sqrt(252)
@@ -152,10 +123,7 @@ def evaluate_model():
         pair_returns[f"配对_{pair_idx}"] = np.sum(returns)
         all_returns.append(np.sum(returns))
         all_sharpe_ratios.append(sharpe_ratio)
-        #计算最大回撤
-        max_drawdown = calculate_max_drawdown(returns)
-        all_max_drawdowns.append(max_drawdown)
-
+        all_max_drawdowns.append(max(0, -np.min(returns)))
     
     # 计算整体统计数据
     mean_return = np.mean(all_returns)

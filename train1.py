@@ -36,18 +36,42 @@ class RLTrainer:
         data = pd.read_csv(self.data_path)
         pairs_data = pd.read_csv(self.pairs_path)
 
-        # 创建环境
-        env = HedgeEnv(data, pairs_data)
+        # ── 按时间切分：训练集70% / 验证集15% / 测试集15% ──
+        data['date'] = pd.to_datetime(data['date'])
+        dates = sorted(data['date'].unique())
+        n = len(dates)
+        train_end = dates[int(n * 0.70)]
+        val_end   = dates[int(n * 0.85)]
+
+        train_data = data[data['date'] <= train_end].copy()
+        val_data   = data[(data['date'] > train_end) & (data['date'] <= val_end)].copy()
+        # 测试集留给 evaluate.py 使用，这里只保存切分点供参考
+        print(f"训练集: {dates[0].date()} ~ {train_end.date()} ({int(n*0.70)} 个交易日)")
+        print(f"验证集: {dates[int(n*0.70)+1].date()} ~ {val_end.date()} ({int(n*0.15)} 个交易日)")
+        print(f"测试集: {dates[int(n*0.85)+1].date()} ~ {dates[-1].date()} ({n - int(n*0.85) - 1} 个交易日)")
+
+        # 保存切分点，供 evaluate.py 读取
+        split_info = {
+            'train_end': str(train_end.date()),
+            'val_end':   str(val_end.date()),
+        }
+        import json
+        with open(os.path.join(self.results_dir, 'data_split.json'), 'w') as f:
+            json.dump(split_info, f, indent=2)
+
+        # 训练环境使用训练集，验证环境使用验证集
+        train_env = HedgeEnv(train_data, pairs_data)
+        val_env   = HedgeEnv(val_data,   pairs_data)
 
         # 创建混合智能体
-        state_dim = env.observation_space.shape[0]
-        action_dim = env.action_space.n
+        state_dim = train_env.observation_space.shape[0]
+        action_dim = train_env.action_space.n
         agent = HybridAgent(state_dim, action_dim)
 
         print("\n开始训练...")
         for episode in tqdm(range(self.episodes)):
             agent.reset()   # 重置时序缓冲区
-            state = env.reset()
+            state = train_env.reset()
             episode_reward = 0
             done = False
 
@@ -57,7 +81,7 @@ class RLTrainer:
                 action = agent.select_action(state)
 
                 # 执行动作
-                next_state, reward, done, info = env.step(action)
+                next_state, reward, done, info = train_env.step(action)
 
                 # 存储经验
                 agent.store_transition(state, action, reward, next_state, done)
@@ -68,9 +92,9 @@ class RLTrainer:
                 state = next_state
                 episode_reward += reward
 
-            # 定期评估
+            # 定期评估（使用验证集，与训练集时间段隔离）
             if (episode + 1) % self.eval_interval == 0:
-                eval_return = self.evaluate(env, agent)
+                eval_return = self.evaluate(val_env, agent)
                 self.eval_history.append(eval_return)
 
                 print(f"\nEpisode {episode + 1}")

@@ -61,10 +61,15 @@ class HedgeEnv:
         self.stock1_prices = stock1_data['close'].values
         self.stock2_prices = stock2_data['close'].values
         
-        # 计算价格比率的统计值
-        price_ratios = self.stock1_prices / self.stock2_prices
-        self.ratio_mean = np.mean(price_ratios[~np.isnan(price_ratios)])
-        self.ratio_std = np.std(price_ratios[~np.isnan(price_ratios)])
+        # 预计算滚动窗口均値和标准差，避免前视偏差
+        # 只使用截至当前时刻的历史数据，不包含未来信息
+        price_ratios = pd.Series(self.stock1_prices / self.stock2_prices)
+        self.rolling_ratio_mean = (
+            price_ratios.rolling(self.window_size, min_periods=2).mean().values
+        )
+        self.rolling_ratio_std = (
+            price_ratios.rolling(self.window_size, min_periods=2).std(ddof=1).values
+        )
         
         # 重置状态
         self.current_step = self.window_size
@@ -165,11 +170,13 @@ class HedgeEnv:
         }
         
     def _calculate_z_score(self):
-        """计算当前价格比率的z-score"""
+        """计算当前价格比率的z-score（滚动窗口，无前视偏差）"""
+        ratio_mean = self.rolling_ratio_mean[self.current_step]
+        ratio_std  = self.rolling_ratio_std[self.current_step]
+        if np.isnan(ratio_mean) or np.isnan(ratio_std) or ratio_std == 0:
+            return 0.0
         price_ratio = self.current_price_1 / self.current_price_2
-        if self.ratio_std == 0:  # 避免除以0
-            return 0
-        return (price_ratio - self.ratio_mean) / self.ratio_std
+        return (price_ratio - ratio_mean) / ratio_std
         
     def _get_observation(self):
         """获取当前状态观察（8维）"""
@@ -179,18 +186,28 @@ class HedgeEnv:
         if self.current_step > self.window_size:
             prev_ratio = (self.stock1_prices[self.current_step - 1] /
                           self.stock2_prices[self.current_step - 1])
-            prev_z = (prev_ratio - self.ratio_mean) / (self.ratio_std + 1e-8)
-            z_velocity = float(np.clip(z_score - prev_z, -2.0, 2.0))
+            prev_mean = self.rolling_ratio_mean[self.current_step - 1]
+            prev_std  = self.rolling_ratio_std[self.current_step - 1]
+            if not (np.isnan(prev_mean) or np.isnan(prev_std) or prev_std == 0):
+                prev_z = (prev_ratio - prev_mean) / prev_std
+                z_velocity = float(np.clip(z_score - prev_z, -2.0, 2.0))
+            else:
+                z_velocity = 0.0
         else:
             z_velocity = 0.0
 
-        # 近期 z-score 波动率（滚动10步标准差）
+        # 近期 z-score 波动率（滚助10步标准差）
         start = max(0, self.current_step - 10)
         recent_ratios = (self.stock1_prices[start:self.current_step] /
                          self.stock2_prices[start:self.current_step])
-        recent_z = (recent_ratios - self.ratio_mean) / (self.ratio_std + 1e-8)
-        z_volatility = float(np.clip(np.std(recent_z) if len(recent_z) > 1 else 0.0,
-                                     0.0, 3.0))
+        recent_means = self.rolling_ratio_mean[start:self.current_step]
+        recent_stds  = self.rolling_ratio_std[start:self.current_step]
+        valid = ~(np.isnan(recent_means) | np.isnan(recent_stds) | (recent_stds == 0))
+        if valid.sum() > 1:
+            recent_z = (recent_ratios[valid] - recent_means[valid]) / recent_stds[valid]
+            z_volatility = float(np.clip(np.std(recent_z), 0.0, 3.0))
+        else:
+            z_volatility = 0.0
 
         # 未实现盆亏率（按初始资金归一化）
         unrealized_pnl = (self.position[0] * self.current_price_1 +

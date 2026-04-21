@@ -21,11 +21,8 @@ conda-env/
 *.pt
 *.ckpt
 
-# ── 实验结果目录（仅保留最新训练 results/train/，忽略其余）────
-results/18对/
-results/train00/
-results/train01/
-results/baseline_*/
+# ── 实验结果目录（图表、中间报告）────────────────────────────
+results/
 
 # ── 大型原始数据文件（超过 GitHub 100MB 限制）────────────────
 data/raw_hedge_data.csv
